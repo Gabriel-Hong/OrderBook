@@ -8,6 +8,12 @@
 #include <numeric>
 #include <algorithm>
 
+// #5: CPU pinning and process priority (Windows)
+#ifdef _WIN32
+#define NOMINMAX
+#include <Windows.h>
+#endif
+
 using namespace orderbook;
 using Clock = std::chrono::high_resolution_clock;
 
@@ -47,9 +53,27 @@ int main() {
     constexpr int NUM_ORDERS = 500'000;
     constexpr int NUM_LEVELS = 1000;
 
+    // #5: Pin thread to CPU 0 and elevate process priority
+#ifdef _WIN32
+    SetThreadAffinityMask(GetCurrentThread(), 1);
+    SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+#endif
+
     std::mt19937 rng(42);
     std::uniform_int_distribution<Price> priceDist(9000, 11000);
     std::uniform_int_distribution<Quantity> qtyDist(1, 100);
+
+    // #5: Warm-up — stabilize caches, page tables, and allocator
+    {
+        OrderBook warmup;
+        for (int i = 0; i < 10'000; ++i) {
+            Side s = (i % 2 == 0) ? Side::Buy : Side::Sell;
+            Price p = priceDist(rng);
+            if (s == Side::Buy) p -= 500; else p += 500;
+            warmup.addOrder(s, OrderType::Limit, p, qtyDist(rng));
+        }
+    }
+    rng.seed(42);  // Reset RNG for deterministic benchmarks
 
     std::cout << "=== OrderBook Benchmark ===\n";
     std::cout << "Orders: " << NUM_ORDERS << "\n\n";

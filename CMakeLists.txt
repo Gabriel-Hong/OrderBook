@@ -1,7 +1,17 @@
 cmake_minimum_required(VERSION 3.14)
 project(OrderBook CXX)
-set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# #6: LTO (Link-Time Optimization) for Release builds
+include(CheckIPOSupported)
+check_ipo_supported(RESULT LTO_SUPPORTED OUTPUT LTO_ERROR)
+if(LTO_SUPPORTED)
+    message(STATUS "LTO enabled")
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE TRUE)
+else()
+    message(STATUS "LTO not supported: ${LTO_ERROR}")
+endif()
 
 # Main demo
 add_executable(orderbook src/main.cpp src/OrderBook.cpp)

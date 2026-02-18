@@ -11,6 +11,8 @@ struct Order {
     Price     price;
     Quantity  quantity;
     Timestamp timestamp;
+    Order*    prev = nullptr;
+    Order*    next = nullptr;
 };
 
 } // namespace orderbook
