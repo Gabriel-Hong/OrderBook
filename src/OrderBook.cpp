@@ -4,170 +4,235 @@
 
 namespace orderbook {
 
+OrderBook::OrderBook(size_t poolCapacity)
+    : bidLevels_(NUM_PRICE_LEVELS)
+    , askLevels_(NUM_PRICE_LEVELS)
+    , orders_(poolCapacity + 1, nullptr)
+    , pool_(poolCapacity)
+{
+}
+
 OrderResult OrderBook::addOrder(Side side, OrderType type, Price price, Quantity quantity) {
-    Order order{};
-    order.id        = nextId_++;
-    order.side      = side;
-    order.type      = type;
-    order.price     = price;
-    order.quantity   = quantity;
-    order.timestamp = std::chrono::steady_clock::now();
+    Order* order   = pool_.alloc();
+    order->id      = nextId_++;
+    order->side    = side;
+    order->type    = type;
+    order->price   = price;
+    order->quantity = quantity;
+    order->timestamp = std::chrono::steady_clock::now();
+    order->prev    = nullptr;
+    order->next    = nullptr;
 
     OrderResult result{};
-    result.orderId           = order.id;
+    result.orderId           = order->id;
     result.filledQuantity    = 0;
     result.remainingQuantity = quantity;
 
     matchOrder(order, result);
 
-    // If there's remaining quantity and it's a limit order, rest on book
-    if (order.quantity > 0 && type == OrderType::Limit) {
-        OrderLocation loc{side, price};
+    result.remainingQuantity = order->quantity;
+
+    // Rest remaining quantity on book (limit orders only)
+    if (order->quantity > 0 && type == OrderType::Limit) [[likely]] {
+        size_t idx = static_cast<size_t>(price - MIN_PRICE);
+
         if (side == Side::Buy) {
-            bids_[price].push_back(order);
+            bool wasEmpty = bidLevels_[idx].empty();
+            bidLevels_[idx].pushBack(order);
+            if (wasEmpty) ++numBidLevels_;
+            if (price > bestBid_) bestBid_ = price;
         } else {
-            asks_[price].push_back(order);
+            bool wasEmpty = askLevels_[idx].empty();
+            askLevels_[idx].pushBack(order);
+            if (wasEmpty) ++numAskLevels_;
+            if (price < bestAsk_) bestAsk_ = price;
         }
-        orders_[order.id] = loc;
+
+        // Grow lookup vector if needed
+        if (order->id >= static_cast<OrderId>(orders_.size())) [[unlikely]] {
+            orders_.resize(static_cast<size_t>(order->id) * 2, nullptr);
+        }
+        orders_[static_cast<size_t>(order->id)] = order;
+        ++numOrders_;
+    } else {
+        // Fully filled or market order — return to pool
+        pool_.dealloc(order);
     }
 
-    result.remainingQuantity = order.quantity;
     return result;
 }
 
 bool OrderBook::cancelOrder(OrderId id) {
-    auto it = orders_.find(id);
-    if (it == orders_.end()) {
+    auto idx = static_cast<size_t>(id);
+    if (idx >= orders_.size() || orders_[idx] == nullptr) [[unlikely]] {
         return false;
     }
 
-    const auto& loc = it->second;
+    Order* order = orders_[idx];
+    size_t levelIdx = static_cast<size_t>(order->price - MIN_PRICE);
 
-    if (loc.side == Side::Buy) {
-        auto levelIt = bids_.find(loc.price);
-        if (levelIt != bids_.end()) {
-            auto& q = levelIt->second;
-            q.erase(std::remove_if(q.begin(), q.end(),
-                [id](const Order& o) { return o.id == id; }), q.end());
-            if (q.empty()) {
-                bids_.erase(levelIt);
+    if (order->side == Side::Buy) {
+        bidLevels_[levelIdx].remove(order);
+        if (bidLevels_[levelIdx].empty()) {
+            --numBidLevels_;
+            if (order->price == bestBid_) {
+                updateBestBidDown();
             }
         }
     } else {
-        auto levelIt = asks_.find(loc.price);
-        if (levelIt != asks_.end()) {
-            auto& q = levelIt->second;
-            q.erase(std::remove_if(q.begin(), q.end(),
-                [id](const Order& o) { return o.id == id; }), q.end());
-            if (q.empty()) {
-                asks_.erase(levelIt);
+        askLevels_[levelIdx].remove(order);
+        if (askLevels_[levelIdx].empty()) {
+            --numAskLevels_;
+            if (order->price == bestAsk_) {
+                updateBestAskUp();
             }
         }
     }
 
-    orders_.erase(it);
+    orders_[idx] = nullptr;
+    --numOrders_;
+    pool_.dealloc(order);
     return true;
 }
 
 std::vector<PriceLevel> OrderBook::getBids(size_t depth) const {
     std::vector<PriceLevel> levels;
     levels.reserve(depth);
-    for (const auto& [price, orders] : bids_) {
-        if (levels.size() >= depth) break;
-        Quantity total = 0;
-        for (const auto& o : orders) {
-            total += o.quantity;
+
+    if (bestBid_ < MIN_PRICE) return levels;
+
+    Price p = bestBid_;
+    while (p >= MIN_PRICE && levels.size() < depth) {
+        const auto& level = bidLevels_[static_cast<size_t>(p - MIN_PRICE)];
+        if (!level.empty()) {
+            Quantity total = 0;
+            for (const Order* o = level.head; o != nullptr; o = o->next) {
+                total += o->quantity;
+            }
+            levels.push_back({p, total, level.count});
         }
-        levels.push_back({price, total, orders.size()});
+        --p;
     }
+
     return levels;
 }
 
 std::vector<PriceLevel> OrderBook::getAsks(size_t depth) const {
     std::vector<PriceLevel> levels;
     levels.reserve(depth);
-    for (const auto& [price, orders] : asks_) {
-        if (levels.size() >= depth) break;
-        Quantity total = 0;
-        for (const auto& o : orders) {
-            total += o.quantity;
+
+    if (bestAsk_ > MAX_PRICE) return levels;
+
+    Price p = bestAsk_;
+    while (p <= MAX_PRICE && levels.size() < depth) {
+        const auto& level = askLevels_[static_cast<size_t>(p - MIN_PRICE)];
+        if (!level.empty()) {
+            Quantity total = 0;
+            for (const Order* o = level.head; o != nullptr; o = o->next) {
+                total += o->quantity;
+            }
+            levels.push_back({p, total, level.count});
         }
-        levels.push_back({price, total, orders.size()});
+        ++p;
     }
+
     return levels;
 }
 
-void OrderBook::matchOrder(Order& order, OrderResult& result) {
-    if (order.side == Side::Buy) {
+void OrderBook::matchOrder(Order* order, OrderResult& result) {
+    result.fills.reserve(16);  // #1: pre-allocate fills vector
+
+    if (order->side == Side::Buy) {
         // Match against asks (lowest price first)
-        while (order.quantity > 0 && !asks_.empty()) {
-            auto bestAskIt = asks_.begin();
-            // For limit orders, check price compatibility
-            if (order.type == OrderType::Limit && order.price < bestAskIt->first) {
+        while (order->quantity > 0 && bestAsk_ <= MAX_PRICE) {
+            if (order->type == OrderType::Limit && order->price < bestAsk_) [[unlikely]] {
                 break;
             }
 
-            auto& queue = bestAskIt->second;
-            while (order.quantity > 0 && !queue.empty()) {
-                auto& resting = queue.front();
-                Quantity fillQty = std::min(order.quantity, resting.quantity);
+            auto& level = askLevels_[static_cast<size_t>(bestAsk_ - MIN_PRICE)];
+            while (order->quantity > 0 && !level.empty()) {
+                Order* resting = level.front();
+                Quantity fillQty = std::min(order->quantity, resting->quantity);
 
                 Fill fill{};
-                fill.makerOrderId = resting.id;
-                fill.takerOrderId = order.id;
-                fill.price        = resting.price;
+                fill.makerOrderId = resting->id;
+                fill.takerOrderId = order->id;
+                fill.price        = resting->price;
                 fill.quantity     = fillQty;
                 result.fills.push_back(fill);
 
-                order.quantity   -= fillQty;
-                resting.quantity -= fillQty;
+                order->quantity   -= fillQty;
+                resting->quantity -= fillQty;
                 result.filledQuantity += fillQty;
 
-                if (resting.quantity == 0) {
-                    orders_.erase(resting.id);
-                    queue.pop_front();
+                if (resting->quantity == 0) [[unlikely]] {
+                    level.remove(resting);
+                    orders_[static_cast<size_t>(resting->id)] = nullptr;
+                    --numOrders_;
+                    pool_.dealloc(resting);
                 }
             }
 
-            if (queue.empty()) {
-                asks_.erase(bestAskIt);
+            if (level.empty()) [[unlikely]] {
+                --numAskLevels_;
+                updateBestAskUp();
             }
         }
     } else {
         // Match against bids (highest price first)
-        while (order.quantity > 0 && !bids_.empty()) {
-            auto bestBidIt = bids_.begin();
-            if (order.type == OrderType::Limit && order.price > bestBidIt->first) {
+        while (order->quantity > 0 && bestBid_ >= MIN_PRICE) {
+            if (order->type == OrderType::Limit && order->price > bestBid_) [[unlikely]] {
                 break;
             }
 
-            auto& queue = bestBidIt->second;
-            while (order.quantity > 0 && !queue.empty()) {
-                auto& resting = queue.front();
-                Quantity fillQty = std::min(order.quantity, resting.quantity);
+            auto& level = bidLevels_[static_cast<size_t>(bestBid_ - MIN_PRICE)];
+            while (order->quantity > 0 && !level.empty()) {
+                Order* resting = level.front();
+                Quantity fillQty = std::min(order->quantity, resting->quantity);
 
                 Fill fill{};
-                fill.makerOrderId = resting.id;
-                fill.takerOrderId = order.id;
-                fill.price        = resting.price;
+                fill.makerOrderId = resting->id;
+                fill.takerOrderId = order->id;
+                fill.price        = resting->price;
                 fill.quantity     = fillQty;
                 result.fills.push_back(fill);
 
-                order.quantity   -= fillQty;
-                resting.quantity -= fillQty;
+                order->quantity   -= fillQty;
+                resting->quantity -= fillQty;
                 result.filledQuantity += fillQty;
 
-                if (resting.quantity == 0) {
-                    orders_.erase(resting.id);
-                    queue.pop_front();
+                if (resting->quantity == 0) [[unlikely]] {
+                    level.remove(resting);
+                    orders_[static_cast<size_t>(resting->id)] = nullptr;
+                    --numOrders_;
+                    pool_.dealloc(resting);
                 }
             }
 
-            if (queue.empty()) {
-                bids_.erase(bestBidIt);
+            if (level.empty()) [[unlikely]] {
+                --numBidLevels_;
+                updateBestBidDown();
             }
         }
     }
+}
+
+void OrderBook::updateBestBidDown() {
+    --bestBid_;
+    while (bestBid_ >= MIN_PRICE &&
+           bidLevels_[static_cast<size_t>(bestBid_ - MIN_PRICE)].empty()) {
+        --bestBid_;
+    }
+    // bestBid_ < MIN_PRICE means no bids exist (sentinel)
+}
+
+void OrderBook::updateBestAskUp() {
+    ++bestAsk_;
+    while (bestAsk_ <= MAX_PRICE &&
+           askLevels_[static_cast<size_t>(bestAsk_ - MIN_PRICE)].empty()) {
+        ++bestAsk_;
+    }
+    // bestAsk_ > MAX_PRICE means no asks exist (sentinel)
 }
 
 } // namespace orderbook
